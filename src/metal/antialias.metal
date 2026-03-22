@@ -36,14 +36,18 @@ struct AntialiasConstParams
 };
 
 //------------------------------------------------------------------------
-// Atomic float add via CAS loop (Metal 3.0 has no native atomic<float>).
-// Operates on a device atomic_uint pointer that aliases a float in memory.
+// Atomic float add.
 
-inline void atomicAddFloat(device atomic_uint* addr, float value)
-{
+#if __METAL_VERSION__ >= 310
+// Metal 3.1 (M3+): native float atomic add
+inline void atomicAddFloat(device atomic_float* addr, float value) {
+    atomic_fetch_add_explicit(addr, value, memory_order_relaxed);
+}
+#else
+// Metal 3.0 fallback: CAS-loop emulation
+inline void atomicAddFloat(device atomic_uint* addr, float value) {
     uint expected = atomic_load_explicit(addr, memory_order_relaxed);
-    while (true)
-    {
+    while (true) {
         float current = as_type<float>(expected);
         float desired = current + value;
         uint desired_bits = as_type<uint>(desired);
@@ -52,6 +56,7 @@ inline void atomicAddFloat(device atomic_uint* addr, float value)
             break;
     }
 }
+#endif
 
 //------------------------------------------------------------------------
 // AAWorkItem flags — matches host-side struct layout.
@@ -525,8 +530,12 @@ kernel void AntialiasFwdAnalysisKernel(
             device const float* pColor1 = color + pixel1 * p.channels;
             device float* pOutput = output + (alpha > 0.f ? pixel0 : pixel1) * p.channels;
 
-            // Atomic add to output via CAS-based float atomics.
+            // Atomic add to output.
+#if __METAL_VERSION__ >= 310
+            device atomic_float* pOutAtomic = (device atomic_float*)pOutput;
+#else
             device atomic_uint* pOutAtomic = (device atomic_uint*)pOutput;
+#endif
             for (int i = 0; i < p.channels; i++)
                 atomicAddFloat(&pOutAtomic[i], alpha * (pColor1[i] - pColor0[i]));
 
@@ -593,9 +602,14 @@ kernel void AntialiasGradKernel(
     if (triIdx < 0 || triIdx >= p.numTriangles)
         return;
 
-    // Outgoing color gradients (via CAS-based float atomics).
+    // Outgoing color gradients.
+#if __METAL_VERSION__ >= 310
+    device atomic_float* pGrad0 = (device atomic_float*)(gradColor + pixel0 * p.channels);
+    device atomic_float* pGrad1 = (device atomic_float*)(gradColor + pixel1 * p.channels);
+#else
     device atomic_uint* pGrad0 = (device atomic_uint*)(gradColor + pixel0 * p.channels);
     device atomic_uint* pGrad1 = (device atomic_uint*)(gradColor + pixel1 * p.channels);
+#endif
 
     // Incoming color gradients.
     device const float* pDy = dy + (alpha > 0.f ? pixel0 : pixel1) * p.channels;
@@ -699,9 +713,14 @@ kernel void AntialiasGradKernel(
         gp2x = gp2y = gp2w = 0.f;
     }
 
-    // Accumulate gradients via CAS-based float atomics.
+    // Accumulate position gradients.
+#if __METAL_VERSION__ >= 310
+    device atomic_float* gp1_a = (device atomic_float*)(gradPos + 4 * vi1);
+    device atomic_float* gp2_a = (device atomic_float*)(gradPos + 4 * vi2);
+#else
     device atomic_uint* gp1_a = (device atomic_uint*)(gradPos + 4 * vi1);
     device atomic_uint* gp2_a = (device atomic_uint*)(gradPos + 4 * vi2);
+#endif
     atomicAddFloat(&gp1_a[0], gp1x);
     atomicAddFloat(&gp1_a[1], gp1y);
     atomicAddFloat(&gp1_a[3], gp1w);
