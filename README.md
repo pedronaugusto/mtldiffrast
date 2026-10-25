@@ -18,7 +18,7 @@ API-compatible with [nvdiffrast](https://github.com/NVlabs/nvdiffrast) for drop-
 
 ## Installation
 
-Requires macOS with Apple Silicon, Xcode command line tools, and PyTorch >= 2.0.
+Requires macOS 14+ on Apple Silicon, Xcode command line tools, and PyTorch >= 2.0.
 
 ```bash
 pip install --no-build-isolation -e .
