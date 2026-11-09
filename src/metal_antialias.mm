@@ -58,20 +58,22 @@ torch::Tensor antialias_construct_topology_hash(const torch::Tensor& tri)
 
     auto pso = mtl_get_pipeline("AntialiasFwdMeshKernel");
     auto queue = mtl_get_queue();
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
-    [enc setBuffer:hash_ref.buffer offset:hash_ref.offset atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
+        [enc setBuffer:hash_ref.buffer offset:hash_ref.offset atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
 
-    NSUInteger threadCount = (NSUInteger)p.numTriangles;
-    NSUInteger threadGroupSize = MIN((NSUInteger)AA_MESH_KERNEL_THREADS_PER_BLOCK, pso.maxTotalThreadsPerThreadgroup);
-    [enc dispatchThreads:MTLSizeMake(threadCount, 1, 1)
-   threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+        NSUInteger threadCount = (NSUInteger)p.numTriangles;
+        NSUInteger threadGroupSize = MIN((NSUInteger)AA_MESH_KERNEL_THREADS_PER_BLOCK, pso.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake(threadCount, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+    }
 
     return ev_hash;
 }
@@ -134,22 +136,24 @@ std::tuple<torch::Tensor, torch::Tensor> antialias_fwd(
     // --- Kernel 1: Discontinuity finder ---
     {
         auto pso = mtl_get_pipeline("AntialiasFwdDiscontinuityKernel");
-        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:0];
-        [enc setBuffer:work_ref.buffer offset:work_ref.offset atIndex:1];
-        [enc setBuffer:work_ref.buffer offset:work_ref.offset atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:0];
+            [enc setBuffer:work_ref.buffer offset:work_ref.offset atIndex:1];
+            [enc setBuffer:work_ref.buffer offset:work_ref.offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
 
-        MTLSize grid = MTLSizeMake((NSUInteger)p.width, (NSUInteger)p.height, (NSUInteger)p.n);
-        NSUInteger tgW = MIN(32u, pso.maxTotalThreadsPerThreadgroup);
-        NSUInteger tgH = MIN(8u, pso.maxTotalThreadsPerThreadgroup / tgW);
-        MTLSize tg = MTLSizeMake(tgW, tgH, 1);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+            MTLSize grid = MTLSizeMake((NSUInteger)p.width, (NSUInteger)p.height, (NSUInteger)p.n);
+            NSUInteger tgW = MIN(32u, pso.maxTotalThreadsPerThreadgroup);
+            NSUInteger tgH = MIN(8u, pso.maxTotalThreadsPerThreadgroup / tgW);
+            MTLSize tg = MTLSizeMake(tgW, tgH, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
+            [cmdBuf commit];
+            [cmdBuf waitUntilCompleted];
+        }
     }
 
     // --- Kernel 2: Analysis ---

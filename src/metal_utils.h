@@ -232,12 +232,14 @@ inline void dispatch_kernel(bool on_mps,
         return;
     }
 #endif
-    id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    encode(cmdBuf, enc);
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        encode(cmdBuf, enc);
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+    }
 }
 
 // Batched variant for kernels that need to issue multiple dispatches within
@@ -260,10 +262,12 @@ inline void dispatch_batch(bool on_mps,
         return;
     }
 #endif
-    id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
-    encode_batch(cmdBuf);
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
+        encode_batch(cmdBuf);
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+    }
 }
 
 } // namespace mtldiffrast

@@ -97,102 +97,105 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
         // On MPS the whole sequence encodes into the active MPSStream; on CPU
         // dispatch_batch commits+waits so the tensor data is valid on return.
 
-        // Create standalone shared render target texture
-        MTLTextureDescriptor* colorTexDesc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
-                                        width:W height:H mipmapped:NO];
-        colorTexDesc.usage = MTLTextureUsageRenderTarget;
-        colorTexDesc.storageMode = MTLStorageModeShared;
-        id<MTLTexture> colorTex = [device_ newTextureWithDescriptor:colorTexDesc];
+        // Autoreleased descriptors hold the render targets; drain them per call.
+        @autoreleasepool {
+            // Create standalone shared render target texture
+            MTLTextureDescriptor* colorTexDesc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                            width:W height:H mipmapped:NO];
+            colorTexDesc.usage = MTLTextureUsageRenderTarget;
+            colorTexDesc.storageMode = MTLStorageModeShared;
+            id<MTLTexture> colorTex = [device_ newTextureWithDescriptor:colorTexDesc];
 
-        // Depth texture (transient — GPU only)
-        MTLTextureDescriptor* depthTexDesc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                        width:W height:H mipmapped:NO];
-        depthTexDesc.usage = MTLTextureUsageRenderTarget;
-        depthTexDesc.storageMode = MTLStorageModePrivate;
-        id<MTLTexture> depthTex = [device_ newTextureWithDescriptor:depthTexDesc];
+            // Depth texture (transient — GPU only)
+            MTLTextureDescriptor* depthTexDesc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                            width:W height:H mipmapped:NO];
+            depthTexDesc.usage = MTLTextureUsageRenderTarget;
+            depthTexDesc.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> depthTex = [device_ newTextureWithDescriptor:depthTexDesc];
 
-        // Render pass descriptor
-        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = colorTex;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+            // Render pass descriptor
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = colorTex;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
-        rpd.depthAttachment.texture = depthTex;
-        rpd.depthAttachment.loadAction = MTLLoadActionClear;
-        rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
-        rpd.depthAttachment.clearDepth = 1.0;  // far plane; first fragment (depth<1) passes Less
+            rpd.depthAttachment.texture = depthTex;
+            rpd.depthAttachment.loadAction = MTLLoadActionClear;
+            rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+            rpd.depthAttachment.clearDepth = 1.0;  // far plane; first fragment (depth<1) passes Less
 
-        struct {
-            int num_triangles;
-            int num_vertices;
-            int width;
-            int height;
-            float xs, xo, ys, yo;
-            int chunk_start;
-        } db_params;
-        db_params.num_triangles = num_triangles;
-        db_params.num_vertices = num_vertices;
-        db_params.width = W;
-        db_params.height = H;
-        db_params.xs = 2.0f / (float)W;
-        db_params.xo = -1.0f + 1.0f / (float)W;
-        db_params.ys = 2.0f / (float)H;
-        db_params.yo = -1.0f + 1.0f / (float)H;
-        db_params.chunk_start = 0;
+            struct {
+                int num_triangles;
+                int num_vertices;
+                int width;
+                int height;
+                float xs, xo, ys, yo;
+                int chunk_start;
+            } db_params;
+            db_params.num_triangles = num_triangles;
+            db_params.num_vertices = num_vertices;
+            db_params.width = W;
+            db_params.height = H;
+            db_params.xs = 2.0f / (float)W;
+            db_params.xo = -1.0f + 1.0f / (float)W;
+            db_params.ys = 2.0f / (float)H;
+            db_params.yo = -1.0f + 1.0f / (float)H;
+            db_params.chunk_start = 0;
 
-        auto db_pso = mtl_get_pipeline("rasterize_db_kernel");
-        auto render_pso = render_pipeline_;
-        auto depth_state = depth_stencil_;
-        int nverts = num_vertices;
-        NSUInteger bytesPerRow = W * 4 * sizeof(float);
+            auto db_pso = mtl_get_pipeline("rasterize_db_kernel");
+            auto render_pso = render_pipeline_;
+            auto depth_state = depth_stencil_;
+            int nverts = num_vertices;
+            NSUInteger bytesPerRow = W * 4 * sizeof(float);
 
-        dispatch_batch(on_mps, ^(id<MTLCommandBuffer> cmdBuf) {
-            // (1) render encoder
-            id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
-            [enc setRenderPipelineState:render_pso];
-            [enc setDepthStencilState:depth_state];
-            [enc setFrontFacingWinding:MTLWindingCounterClockwise];
-            [enc setCullMode:MTLCullModeNone];
-            // Flip Y to match compute kernel convention (Y=0 at bottom)
-            MTLViewport viewport = {0.0, (double)H, (double)W, -(double)H, 0.0, 1.0};
-            [enc setViewport:viewport];
-            [enc setVertexBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
-            [enc setVertexBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
-            [enc setVertexBytes:&nverts length:sizeof(int) atIndex:2];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle
-                    vertexStart:0
-                    vertexCount:num_triangles * 3];
-            [enc endEncoding];
+            dispatch_batch(on_mps, ^(id<MTLCommandBuffer> cmdBuf) {
+                // (1) render encoder
+                id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+                [enc setRenderPipelineState:render_pso];
+                [enc setDepthStencilState:depth_state];
+                [enc setFrontFacingWinding:MTLWindingCounterClockwise];
+                [enc setCullMode:MTLCullModeNone];
+                // Flip Y to match compute kernel convention (Y=0 at bottom)
+                MTLViewport viewport = {0.0, (double)H, (double)W, -(double)H, 0.0, 1.0};
+                [enc setViewport:viewport];
+                [enc setVertexBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
+                [enc setVertexBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
+                [enc setVertexBytes:&nverts length:sizeof(int) atIndex:2];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:num_triangles * 3];
+                [enc endEncoding];
 
-            // (2) blit: colorTex -> rast_out buffer. Metal guarantees
-            // encoder ordering within a cmdBuf, so the compute pass below
-            // sees the blit's writes to the rast_out buffer.
-            id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-            [blit copyFromTexture:colorTex
-                      sourceSlice:0
-                      sourceLevel:0
-                     sourceOrigin:MTLOriginMake(0, 0, 0)
-                       sourceSize:MTLSizeMake(W, H, 1)
-                         toBuffer:out_ref.buffer
-                destinationOffset:out_ref.offset
-           destinationBytesPerRow:bytesPerRow
-         destinationBytesPerImage:bytesPerRow * H];
-            [blit endEncoding];
+                // (2) blit: colorTex -> rast_out buffer. Metal guarantees
+                // encoder ordering within a cmdBuf, so the compute pass below
+                // sees the blit's writes to the rast_out buffer.
+                id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+                [blit copyFromTexture:colorTex
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(W, H, 1)
+                             toBuffer:out_ref.buffer
+                    destinationOffset:out_ref.offset
+               destinationBytesPerRow:bytesPerRow
+             destinationBytesPerImage:bytesPerRow * H];
+                [blit endEncoding];
 
-            // (3) compute: rast_db derivatives from rast_out and pos/tri
-            id<MTLComputeCommandEncoder> dbEnc = [cmdBuf computeCommandEncoder];
-            [dbEnc setComputePipelineState:db_pso];
-            [dbEnc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
-            [dbEnc setBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
-            [dbEnc setBytes:&db_params length:sizeof(db_params) atIndex:2];
-            [dbEnc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
-            [dbEnc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
-            [dbEnc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-            [dbEnc endEncoding];
-        });
+                // (3) compute: rast_db derivatives from rast_out and pos/tri
+                id<MTLComputeCommandEncoder> dbEnc = [cmdBuf computeCommandEncoder];
+                [dbEnc setComputePipelineState:db_pso];
+                [dbEnc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
+                [dbEnc setBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
+                [dbEnc setBytes:&db_params length:sizeof(db_params) atIndex:2];
+                [dbEnc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
+                [dbEnc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
+                [dbEnc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [dbEnc endEncoding];
+            });
+        }
 
     } else {
         // ─── Compute kernel fallback ─────────────────────────────────
